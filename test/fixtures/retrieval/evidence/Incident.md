@@ -8,4 +8,5 @@ status: active
 ---
 # Orchestration Incident Evidence
 
-This evidence record is protected and must not be returned by default retrieval.
+This incident evidence is Tier 3 source material. It can be intentionally retrieved but must never enter default automatic search.
+

@@ -8,26 +8,42 @@ import {
   resolveReferences,
 } from "./reference-resolver.js";
 
+import {
+  canSurfaceRelatedAuthority,
+  classifyKnowledgeAuthority,
+  isAuthoritySearchEligible,
+  isProtectedPath,
+  resolveAuthorityPathPolicy,
+  resolveProtectedPrefixes,
+  resolveRetrievalBudgets,
+  resolveSearchKnowledgeScope,
+} from "./retrieval-policy.js";
+
+import type {
+  AuthorityPathPolicyOptions,
+  KnowledgeAuthority,
+  RetrievalBudgetOptions,
+  RetrievalBudgets,
+  SearchKnowledgeScope,
+} from "./retrieval-policy.js";
+
 import type {
   ReferenceResolution,
   VaultInventory,
   VaultNote,
 } from "./types.js";
 
-export const DEFAULT_PROTECTED_PREFIXES = [
-  "raw",
-  "evidence",
-] as const;
+export {
+  DEFAULT_PROTECTED_PREFIXES,
+} from "./retrieval-policy.js";
 
-const DEFAULT_SEARCH_LIMIT = 10;
-const MAX_SEARCH_LIMIT = 25;
-const DEFAULT_SECTION_MAX_CHARS = 6_000;
-const MAX_SECTION_MAX_CHARS = 16_000;
-const MAX_EVIDENCE_CHARS = 180;
+const MAX_EVIDENCE_ITEMS = 3;
 const MAX_METADATA_VALUES = 50;
 const MAX_METADATA_VALUE_CHARS = 240;
 const MAX_METADATA_HEADINGS = 200;
 const MAX_METADATA_LINKS = 200;
+const MAX_SEARCH_METADATA_VALUES = 5;
+const MAX_SEARCH_METADATA_VALUE_CHARS = 120;
 
 export type RelevanceEvidenceKind =
   | "title"
@@ -41,10 +57,16 @@ export type RelevanceEvidenceKind =
 export interface KnowledgeRetrievalOptions {
   vaultRoot: string;
   protectedPrefixes?: string[];
+  authorityPolicy?:
+    AuthorityPathPolicyOptions;
+  budgets?: RetrievalBudgetOptions;
 }
 
 export interface KnowledgeRetrievalServiceOptions {
   protectedPrefixes?: string[];
+  authorityPolicy?:
+    AuthorityPathPolicyOptions;
+  budgets?: RetrievalBudgetOptions;
 }
 
 export interface SearchKnowledgeInput {
@@ -54,6 +76,7 @@ export interface SearchKnowledgeInput {
   tags?: string[];
   type?: string;
   status?: string;
+  scope?: SearchKnowledgeScope;
   limit?: number;
 }
 
@@ -62,16 +85,26 @@ export interface RelevanceEvidence {
   text: string;
 }
 
+export interface SearchKnowledgeMetadata {
+  project: string[];
+  tags: string[];
+  type: string[];
+  status: string[];
+}
+
 export interface SearchKnowledgeResult {
   path: string;
   title: string;
+  authority: KnowledgeAuthority;
   score: number;
+  metadata: SearchKnowledgeMetadata;
   evidence: RelevanceEvidence[];
 }
 
 export interface NoteMetadata {
   path: string;
   title: string;
+  authority: KnowledgeAuthority;
   aliases: string[];
   tags: string[];
   project: string[];
@@ -97,12 +130,12 @@ export interface GetNoteSectionInput {
 export interface NoteSectionResult {
   path: string;
   title: string;
+  authority: KnowledgeAuthority;
   heading: string | null;
   content: string;
   truncated: boolean;
   charsReturned: number;
   bytesReturned: number;
-  approximateTokens: number;
 }
 
 export interface GetRelatedNotesInput {
@@ -118,7 +151,9 @@ export type RelatedNoteRelationship =
 export interface RelatedNoteResult {
   path: string;
   title: string;
-  relationship: RelatedNoteRelationship;
+  authority: KnowledgeAuthority;
+  relationship:
+    RelatedNoteRelationship;
   evidence: string;
 }
 
@@ -153,7 +188,10 @@ function truncateText(
     return value;
   }
 
-  return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
+  return `${value.slice(
+    0,
+    Math.max(0, maxChars - 1),
+  )}…`;
 }
 
 /** Normalizes text for deterministic case-insensitive lexical matching. */
@@ -198,7 +236,10 @@ function normalizeVaultRelativePath(
     path.posix.isAbsolute(value) ||
     value
       .split("/")
-      .some((segment) => segment === "..")
+      .some(
+        (segment) =>
+          segment === "..",
+      )
   ) {
     throw new Error(
       `${label} must be a vault-relative path.`,
@@ -223,49 +264,6 @@ function normalizeVaultRelativePath(
   return normalized;
 }
 
-/** Normalizes one configured protected prefix and rejects path traversal components. */
-function normalizeProtectedPrefix(
-  input: string,
-): string {
-  const value = input
-    .trim()
-    .replaceAll("\\", "/")
-    .replace(/^\/+|\/+$/g, "");
-
-  if (!value) {
-    return "";
-  }
-
-  return normalizeVaultRelativePath(
-    value,
-    "Protected prefix",
-  );
-}
-
-/** Returns true when a note is equal to or below a configured protected prefix. */
-function isProtectedPath(
-  notePath: string,
-  protectedPrefixes: string[],
-): boolean {
-  const normalizedPath =
-    notePath.toLowerCase();
-
-  return protectedPrefixes.some(
-    (prefix) => {
-      const normalizedPrefix =
-        prefix.toLowerCase();
-
-      return (
-        normalizedPath ===
-          normalizedPrefix ||
-        normalizedPath.startsWith(
-          `${normalizedPrefix}/`,
-        )
-      );
-    },
-  );
-}
-
 /** Extracts string values from one frontmatter property while ignoring unsupported shapes. */
 function getFrontmatterValues(
   note: VaultNote,
@@ -286,7 +284,10 @@ function getFrontmatterValues(
         (item): item is string =>
           typeof item === "string",
       )
-      .map((item) => item.trim())
+      .map(
+        (item) =>
+          item.trim(),
+      )
       .filter(Boolean);
   }
 
@@ -309,13 +310,15 @@ function getTags(
   ];
 
   const tags = rawValues
-    .flatMap((value) =>
-      value.split(","),
+    .flatMap(
+      (value) =>
+        value.split(","),
     )
-    .map((value) =>
-      value
-        .trim()
-        .replace(/^#+/, ""),
+    .map(
+      (value) =>
+        value
+          .trim()
+          .replace(/^#+/, ""),
     )
     .filter(Boolean);
 
@@ -364,7 +367,7 @@ function getTitle(
   );
 }
 
-/** Returns bounded metadata values suitable for MCP responses. */
+/** Returns bounded metadata values suitable for metadata responses. */
 function presentMetadataValues(
   values: string[],
 ): string[] {
@@ -373,12 +376,67 @@ function presentMetadataValues(
       0,
       MAX_METADATA_VALUES,
     )
-    .map((value) =>
-      truncateText(
-        value,
-        MAX_METADATA_VALUE_CHARS,
-      ),
+    .map(
+      (value) =>
+        truncateText(
+          value,
+          MAX_METADATA_VALUE_CHARS,
+        ),
     );
+}
+
+/** Returns smaller bounded metadata values suitable for search-result selection context. */
+function presentSearchMetadataValues(
+  values: string[],
+): string[] {
+  return values
+    .slice(
+      0,
+      MAX_SEARCH_METADATA_VALUES,
+    )
+    .map(
+      (value) =>
+        truncateText(
+          value,
+          MAX_SEARCH_METADATA_VALUE_CHARS,
+        ),
+    );
+}
+
+/** Builds compact deterministic metadata that helps callers select a search result without returning note content. */
+function getSearchMetadata(
+  note: VaultNote,
+): SearchKnowledgeMetadata {
+  return {
+    project:
+      presentSearchMetadataValues(
+        getFrontmatterValues(
+          note,
+          "project",
+        ),
+      ),
+
+    tags:
+      presentSearchMetadataValues(
+        getTags(note),
+      ),
+
+    type:
+      presentSearchMetadataValues(
+        getFrontmatterValues(
+          note,
+          "type",
+        ),
+      ),
+
+    status:
+      presentSearchMetadataValues(
+        getFrontmatterValues(
+          note,
+          "status",
+        ),
+      ),
+  };
 }
 
 /** Tests a frontmatter filter using normalized exact matching against all string values. */
@@ -453,40 +511,79 @@ function matchesFolder(
   );
 }
 
-/** Validates and normalizes a bounded result limit. */
-function resolveLimit(
+/** Validates one caller-supplied result limit against the configured retrieval maximum. */
+function resolveResultLimit(
   value: number | undefined,
+  budgets: RetrievalBudgets,
 ): number {
   const limit =
-    value ?? DEFAULT_SEARCH_LIMIT;
+    value ??
+    budgets.defaultSearchLimit;
 
   if (
     !Number.isInteger(limit) ||
     limit < 1 ||
-    limit > MAX_SEARCH_LIMIT
+    limit > budgets.maxSearchResults
   ) {
     throw new Error(
-      `Limit must be an integer between 1 and ${MAX_SEARCH_LIMIT}.`,
+      `Limit must be an integer between 1 and ${budgets.maxSearchResults}.`,
     );
   }
 
   return limit;
 }
 
-/** Adds one concise relevance evidence item while avoiding duplicate evidence. */
+/** Validates one requested content character limit against the operation-specific configured maximum. */
+function resolveContentLimit(
+  value: number,
+  configuredMaximum: number,
+  label: string,
+): number {
+  if (
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > configuredMaximum
+  ) {
+    throw new Error(
+      `${label} must be an integer between 1 and ${configuredMaximum}.`,
+    );
+  }
+
+  return value;
+}
+
+/** Adds one concise relevance evidence item while respecting one total per-result excerpt character budget. */
 function addEvidence(
   evidence: RelevanceEvidence[],
   kind: RelevanceEvidenceKind,
   text: string,
+  maxExcerptChars: number,
 ): void {
-  if (evidence.length >= 3) {
+  if (
+    evidence.length >=
+    MAX_EVIDENCE_ITEMS
+  ) {
+    return;
+  }
+
+  const usedChars =
+    evidence.reduce(
+      (total, item) =>
+        total + item.text.length,
+      0,
+    );
+
+  const remainingChars =
+    maxExcerptChars - usedChars;
+
+  if (remainingChars <= 0) {
     return;
   }
 
   const presented =
     truncateText(
       text.trim(),
-      MAX_EVIDENCE_CHARS,
+      remainingChars,
     );
 
   if (!presented) {
@@ -554,10 +651,11 @@ function findBodyEvidence(
   return null;
 }
 
-/** Calculates a deterministic weighted lexical score and concise evidence for one note. */
+/** Calculates the existing deterministic weighted lexical score and bounded concise evidence for one note. */
 function scoreNote(
   note: VaultNote,
   query: string,
+  maxExcerptChars: number,
 ): {
   score: number;
   evidence: RelevanceEvidence[];
@@ -641,6 +739,7 @@ function scoreNote(
       evidence,
       "title",
       title,
+      maxExcerptChars,
     );
   } else if (
     phrase &&
@@ -653,6 +752,7 @@ function scoreNote(
       evidence,
       "title",
       title,
+      maxExcerptChars,
     );
   }
 
@@ -667,6 +767,7 @@ function scoreNote(
         evidence,
         "title",
         title,
+        maxExcerptChars,
       );
     }
   }
@@ -689,17 +790,19 @@ function scoreNote(
     );
 
   if (matchingHeading) {
-    score += phrase &&
+    score +=
+      phrase &&
       normalizeText(
         matchingHeading,
       ).includes(phrase)
-      ? 40
-      : 20;
+        ? 40
+        : 20;
 
     addEvidence(
       evidence,
       "heading",
       matchingHeading,
+      maxExcerptChars,
     );
   }
 
@@ -737,6 +840,7 @@ function scoreNote(
       evidence,
       "alias",
       matchingAlias,
+      maxExcerptChars,
     );
   }
 
@@ -763,6 +867,7 @@ function scoreNote(
       evidence,
       "tag",
       matchingTag,
+      maxExcerptChars,
     );
   }
 
@@ -789,6 +894,7 @@ function scoreNote(
       evidence,
       "frontmatter",
       matchingMetadata,
+      maxExcerptChars,
     );
   }
 
@@ -831,6 +937,7 @@ function scoreNote(
       evidence,
       "body",
       bodyEvidence,
+      maxExcerptChars,
     );
   }
 
@@ -842,6 +949,7 @@ function scoreNote(
       evidence,
       "path",
       note.path,
+      maxExcerptChars,
     );
   }
 
@@ -1037,7 +1145,7 @@ function extractSection(
   };
 }
 
-/** Applies the requested character bound and reports transparent size and token-proxy metadata. */
+/** Applies one explicit character bound and reports actual returned characters and UTF-8 bytes. */
 function boundContent(
   content: string,
   maxChars: number,
@@ -1046,19 +1154,7 @@ function boundContent(
   truncated: boolean;
   charsReturned: number;
   bytesReturned: number;
-  approximateTokens: number;
 } {
-  if (
-    !Number.isInteger(maxChars) ||
-    maxChars < 1 ||
-    maxChars >
-      MAX_SECTION_MAX_CHARS
-  ) {
-    throw new Error(
-      `maxChars must be an integer between 1 and ${MAX_SECTION_MAX_CHARS}.`,
-    );
-  }
-
   const truncated =
     content.length > maxChars;
 
@@ -1080,11 +1176,154 @@ function boundContent(
         bounded,
         "utf8",
       ),
-    approximateTokens:
-      Math.ceil(
-        bounded.length / 4,
-      ),
   };
+}
+
+/** Measures the UTF-8 size of one transport-neutral knowledge payload using its JSON representation. */
+function measurePayloadBytes(
+  payload: unknown,
+): number {
+  return Buffer.byteLength(
+    JSON.stringify(payload),
+    "utf8",
+  );
+}
+
+/** Rejects a bounded non-content payload when it still exceeds the configured aggregate response ceiling. */
+function assertPayloadWithinBudget(
+  payload: unknown,
+  maxAggregateBytes: number,
+  label: string,
+): void {
+  const bytes =
+    measurePayloadBytes(
+      payload,
+    );
+
+  if (bytes > maxAggregateBytes) {
+    throw new Error(
+      `${label} exceeds the configured aggregate payload budget of ${maxAggregateBytes} UTF-8 bytes.`,
+    );
+  }
+}
+
+/** Selects a deterministic prefix of ranked results that respects both count and aggregate UTF-8 payload budgets. */
+function boundResultCollection<
+  Result,
+>(
+  results: Result[],
+  limit: number,
+  maxAggregateBytes: number,
+  label: string,
+): Result[] {
+  const selected: Result[] = [];
+
+  for (const result of results) {
+    if (selected.length >= limit) {
+      break;
+    }
+
+    const candidate = [
+      ...selected,
+      result,
+    ];
+
+    if (
+      measurePayloadBytes({
+        results: candidate,
+      }) > maxAggregateBytes
+    ) {
+      if (selected.length === 0) {
+        throw new Error(
+          `${label} cannot fit one result inside the configured aggregate payload budget of ${maxAggregateBytes} UTF-8 bytes.`,
+        );
+      }
+
+      break;
+    }
+
+    selected.push(result);
+  }
+
+  return selected;
+}
+
+/** Shrinks only the returned section content when aggregate JSON size is tighter than its character limit. */
+function fitSectionToAggregateBudget(
+  result: NoteSectionResult,
+  maxAggregateBytes: number,
+): NoteSectionResult {
+  if (
+    measurePayloadBytes(result) <=
+    maxAggregateBytes
+  ) {
+    return result;
+  }
+
+  const characters =
+    Array.from(result.content);
+
+  let low = 0;
+  let high = characters.length;
+  let bestContent = "";
+
+  while (low <= high) {
+    const middle =
+      Math.floor(
+        (low + high) / 2,
+      );
+
+    const content =
+      characters
+        .slice(0, middle)
+        .join("");
+
+    const candidate:
+      NoteSectionResult = {
+        ...result,
+        content,
+        truncated: true,
+        charsReturned:
+          content.length,
+        bytesReturned:
+          Buffer.byteLength(
+            content,
+            "utf8",
+          ),
+      };
+
+    if (
+      measurePayloadBytes(candidate) <=
+      maxAggregateBytes
+    ) {
+      bestContent = content;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  const fitted:
+    NoteSectionResult = {
+      ...result,
+      content: bestContent,
+      truncated: true,
+      charsReturned:
+        bestContent.length,
+      bytesReturned:
+        Buffer.byteLength(
+          bestContent,
+          "utf8",
+        ),
+    };
+
+  assertPayloadWithinBudget(
+    fitted,
+    maxAggregateBytes,
+    "get_note_section response",
+  );
+
+  return fitted;
 }
 
 /** Creates a stable unique path list while preserving no duplicate resolved link targets. */
@@ -1103,11 +1342,14 @@ export class KnowledgeRetrievalService {
   private readonly noteByPath:
     Map<string, VaultNote>;
 
+  private readonly authorityByPath:
+    Map<string, KnowledgeAuthority>;
+
   private readonly resolutions:
     ReferenceResolution[];
 
-  private readonly protectedPrefixes:
-    string[];
+  private readonly budgets:
+    RetrievalBudgets;
 
   /** Builds retrieval indexes from an existing read-only inventory without modifying or rereading vault files. */
   constructor(
@@ -1116,23 +1358,27 @@ export class KnowledgeRetrievalService {
       KnowledgeRetrievalServiceOptions =
         {},
   ) {
-    const configuredPrefixes =
-      options.protectedPrefixes ??
-      [...DEFAULT_PROTECTED_PREFIXES];
+    const protectedPrefixes =
+      resolveProtectedPrefixes(
+        options.protectedPrefixes,
+      );
 
-    this.protectedPrefixes =
-      configuredPrefixes
-        .map(
-          normalizeProtectedPrefix,
-        )
-        .filter(Boolean);
+    const authorityPolicy =
+      resolveAuthorityPathPolicy(
+        options.authorityPolicy,
+      );
+
+    this.budgets =
+      resolveRetrievalBudgets(
+        options.budgets,
+      );
 
     this.notes =
       inventory.notes.filter(
         (note) =>
           !isProtectedPath(
             note.path,
-            this.protectedPrefixes,
+            protectedPrefixes,
           ),
       );
 
@@ -1146,7 +1392,20 @@ export class KnowledgeRetrievalService {
         ),
       );
 
-    const visiblePaths =
+    this.authorityByPath =
+      new Map(
+        this.notes.map(
+          (note) => [
+            note.path,
+            classifyKnowledgeAuthority(
+              note.path,
+              authorityPolicy,
+            ),
+          ],
+        ),
+      );
+
+    const readablePaths =
       new Set(
         this.notes.map(
           (note) =>
@@ -1159,21 +1418,21 @@ export class KnowledgeRetrievalService {
         inventory,
       ).filter(
         (resolution) =>
-          visiblePaths.has(
+          readablePaths.has(
             resolution.reference
               .sourcePath,
           ) &&
           (
             resolution.resolvedPath ===
               null ||
-            visiblePaths.has(
+            readablePaths.has(
               resolution.resolvedPath,
             )
           ),
       );
   }
 
-  /** Searches visible notes using weighted lexical ranking, exact filters, and deterministic path tie breaking. */
+  /** Searches only the requested authority surface using the existing lexical weighting, exact filters, and deterministic path tie breaking. */
   searchKnowledge(
     input: SearchKnowledgeInput,
   ): SearchKnowledgeResult[] {
@@ -1198,18 +1457,31 @@ export class KnowledgeRetrievalService {
       );
     }
 
+    const scope =
+      resolveSearchKnowledgeScope(
+        input.scope,
+      );
+
     const limit =
-      resolveLimit(
+      resolveResultLimit(
         input.limit,
+        this.budgets,
       );
 
     const results:
       SearchKnowledgeResult[] = [];
 
-    for (
-      const note of this.notes
-    ) {
+    for (const note of this.notes) {
+      const authority =
+        this.getAuthority(
+          note.path,
+        );
+
       if (
+        !isAuthoritySearchEligible(
+          authority,
+          scope,
+        ) ||
         !matchesFolder(
           note.path,
           input.folder,
@@ -1241,6 +1513,8 @@ export class KnowledgeRetrievalService {
         scoreNote(
           note,
           query,
+          this.budgets
+            .searchExcerptChars,
         );
 
       if (ranked.score <= 0) {
@@ -1251,8 +1525,11 @@ export class KnowledgeRetrievalService {
         path: note.path,
         title:
           getTitle(note),
+        authority,
         score:
           ranked.score,
+        metadata:
+          getSearchMetadata(note),
         evidence:
           ranked.evidence,
       });
@@ -1268,19 +1545,27 @@ export class KnowledgeRetrievalService {
         ),
     );
 
-    return results.slice(
-      0,
+    return boundResultCollection(
+      results,
       limit,
+      this.budgets
+        .maxAggregateBytes,
+      "search_knowledge response",
     );
   }
 
-  /** Returns bounded note metadata and visible resolved note-link relationships without returning the note body. */
+  /** Returns bounded body-free metadata for one exact unprotected note while filtering relationships by the selected note's authority surface. */
   getNoteMetadata(
     notePathInput: string,
   ): NoteMetadata {
     const note =
-      this.getVisibleNote(
+      this.getReadableNote(
         notePathInput,
+      );
+
+    const authority =
+      this.getAuthority(
+        note.path,
       );
 
     const outgoingLinks =
@@ -1299,7 +1584,8 @@ export class KnowledgeRetrievalService {
               ) &&
               resolution.resolvedPath !==
                 null &&
-              this.noteByPath.has(
+              this.canSurfaceRelatedPath(
+                authority,
                 resolution.resolvedPath,
               ),
           )
@@ -1325,7 +1611,8 @@ export class KnowledgeRetrievalService {
               ) &&
               resolution.resolvedPath ===
                 note.path &&
-              this.noteByPath.has(
+              this.canSurfaceRelatedPath(
+                authority,
                 resolution.reference
                   .sourcePath,
               ),
@@ -1340,75 +1627,86 @@ export class KnowledgeRetrievalService {
         MAX_METADATA_LINKS,
       );
 
-    return {
-      path: note.path,
-      title:
-        getTitle(note),
+    const metadata:
+      NoteMetadata = {
+        path: note.path,
+        title:
+          getTitle(note),
+        authority,
 
-      aliases:
-        presentMetadataValues(
-          note.aliases,
-        ),
-
-      tags:
-        presentMetadataValues(
-          getTags(note),
-        ),
-
-      project:
-        presentMetadataValues(
-          getFrontmatterValues(
-            note,
-            "project",
-          ),
-        ),
-
-      type:
-        presentMetadataValues(
-          getFrontmatterValues(
-            note,
-            "type",
-          ),
-        ),
-
-      status:
-        presentMetadataValues(
-          getFrontmatterValues(
-            note,
-            "status",
-          ),
-        ),
-
-      headings:
-        note.headings
-          .slice(
-            0,
-            MAX_METADATA_HEADINGS,
-          )
-          .map(
-            (heading) => ({
-              level:
-                heading.level,
-
-              text:
-                truncateText(
-                  heading.text,
-                  MAX_METADATA_VALUE_CHARS,
-                ),
-            }),
+        aliases:
+          presentMetadataValues(
+            note.aliases,
           ),
 
-      outgoingLinks,
-      backlinks,
-      sizeBytes:
-        note.sizeBytes,
-      lineCount:
-        note.lineCount,
-      modifiedAt:
-        new Date(
-          note.mtimeMs,
-        ).toISOString(),
-    };
+        tags:
+          presentMetadataValues(
+            getTags(note),
+          ),
+
+        project:
+          presentMetadataValues(
+            getFrontmatterValues(
+              note,
+              "project",
+            ),
+          ),
+
+        type:
+          presentMetadataValues(
+            getFrontmatterValues(
+              note,
+              "type",
+            ),
+          ),
+
+        status:
+          presentMetadataValues(
+            getFrontmatterValues(
+              note,
+              "status",
+            ),
+          ),
+
+        headings:
+          note.headings
+            .slice(
+              0,
+              MAX_METADATA_HEADINGS,
+            )
+            .map(
+              (heading) => ({
+                level:
+                  heading.level,
+
+                text:
+                  truncateText(
+                    heading.text,
+                    MAX_METADATA_VALUE_CHARS,
+                  ),
+              }),
+            ),
+
+        outgoingLinks,
+        backlinks,
+        sizeBytes:
+          note.sizeBytes,
+        lineCount:
+          note.lineCount,
+        modifiedAt:
+          new Date(
+            note.mtimeMs,
+          ).toISOString(),
+      };
+
+    assertPayloadWithinBudget(
+      metadata,
+      this.budgets
+        .maxAggregateBytes,
+      "get_note_metadata response",
+    );
+
+    return metadata;
   }
 
   /** Returns one bounded heading section, or a bounded full body only when maxChars is explicitly supplied. */
@@ -1416,12 +1714,15 @@ export class KnowledgeRetrievalService {
     input: GetNoteSectionInput,
   ): NoteSectionResult {
     const note =
-      this.getVisibleNote(
+      this.getReadableNote(
         input.path,
       );
 
+    const isFullNote =
+      !input.heading;
+
     if (
-      !input.heading &&
+      isFullNote &&
       input.maxChars === undefined
     ) {
       throw new Error(
@@ -1440,9 +1741,23 @@ export class KnowledgeRetrievalService {
             content: note.body,
           };
 
-    const maxChars =
+    const configuredMaximum =
+      isFullNote
+        ? this.budgets
+            .maxFullNoteChars
+        : this.budgets
+            .maxSectionChars;
+
+    const requestedMaximum =
       input.maxChars ??
-      DEFAULT_SECTION_MAX_CHARS;
+      configuredMaximum;
+
+    const maxChars =
+      resolveContentLimit(
+        requestedMaximum,
+        configuredMaximum,
+        "maxChars",
+      );
 
     const bounded =
       boundContent(
@@ -1450,30 +1765,45 @@ export class KnowledgeRetrievalService {
         maxChars,
       );
 
-    return {
-      path: note.path,
-      title:
-        getTitle(note),
+    const result:
+      NoteSectionResult = {
+        path: note.path,
+        title:
+          getTitle(note),
+        authority:
+          this.getAuthority(
+            note.path,
+          ),
+        heading:
+          extracted.heading,
+        ...bounded,
+      };
 
-      heading:
-        extracted.heading,
-
-      ...bounded,
-    };
+    return fitSectionToAggregateBudget(
+      result,
+      this.budgets
+        .maxAggregateBytes,
+    );
   }
 
-  /** Returns related visible notes from resolved outgoing links and backlinks with mutual links ranked first. */
+  /** Returns authority-filtered related notes from resolved outgoing links and backlinks with mutual links ranked first. */
   getRelatedNotes(
     input: GetRelatedNotesInput,
   ): RelatedNoteResult[] {
     const note =
-      this.getVisibleNote(
+      this.getReadableNote(
         input.path,
       );
 
+    const authority =
+      this.getAuthority(
+        note.path,
+      );
+
     const limit =
-      resolveLimit(
+      resolveResultLimit(
         input.limit,
+        this.budgets,
       );
 
     const outgoing =
@@ -1504,7 +1834,8 @@ export class KnowledgeRetrievalService {
           note.path &&
         resolution.resolvedPath !==
           note.path &&
-        this.noteByPath.has(
+        this.canSurfaceRelatedPath(
+          authority,
           resolution.resolvedPath,
         )
       ) {
@@ -1519,7 +1850,8 @@ export class KnowledgeRetrievalService {
         resolution.reference
           .sourcePath !==
           note.path &&
-        this.noteByPath.has(
+        this.canSurfaceRelatedPath(
+          authority,
           resolution.reference
             .sourcePath,
         )
@@ -1563,6 +1895,11 @@ export class KnowledgeRetrievalService {
               relatedPath,
             );
 
+          const relatedAuthority =
+            this.getAuthority(
+              relatedPath,
+            );
+
           if (
             isOutgoing &&
             isIncoming
@@ -1574,6 +1911,8 @@ export class KnowledgeRetrievalService {
                 getTitle(
                   related,
                 ),
+              authority:
+                relatedAuthority,
               relationship:
                 "mutual",
               evidence:
@@ -1589,10 +1928,12 @@ export class KnowledgeRetrievalService {
                 getTitle(
                   related,
                 ),
+              authority:
+                relatedAuthority,
               relationship:
                 "outgoing",
               evidence:
-                `${note.path} contains a resolved link to this note.`,
+                "The requested note contains a resolved link to this note.",
             };
           }
 
@@ -1603,6 +1944,8 @@ export class KnowledgeRetrievalService {
               getTitle(
                 related,
               ),
+            authority:
+              relatedAuthority,
             relationship:
               "backlink",
             evidence:
@@ -1635,14 +1978,56 @@ export class KnowledgeRetrievalService {
         ),
     );
 
-    return results.slice(
-      0,
+    return boundResultCollection(
+      results,
       limit,
+      this.budgets
+        .maxAggregateBytes,
+      "get_related_notes response",
     );
   }
 
-  /** Resolves one exact visible vault-relative Markdown path without exposing protected-note existence. */
-  private getVisibleNote(
+  /** Returns true when one related path is readable and does not expand beyond the source note's authority surface. */
+  private canSurfaceRelatedPath(
+    sourceAuthority:
+      KnowledgeAuthority,
+    candidatePath: string,
+  ): boolean {
+    const candidateAuthority =
+      this.authorityByPath.get(
+        candidatePath,
+      );
+
+    if (!candidateAuthority) {
+      return false;
+    }
+
+    return canSurfaceRelatedAuthority(
+      sourceAuthority,
+      candidateAuthority,
+    );
+  }
+
+  /** Returns the immutable authority classification for one unprotected note in the retrieval snapshot. */
+  private getAuthority(
+    notePath: string,
+  ): KnowledgeAuthority {
+    const authority =
+      this.authorityByPath.get(
+        notePath,
+      );
+
+    if (!authority) {
+      throw new Error(
+        `Authority classification missing from retrieval snapshot: ${notePath}`,
+      );
+    }
+
+    return authority;
+  }
+
+  /** Resolves one exact unprotected vault-relative Markdown path without exposing permanently protected-note existence. */
+  private getReadableNote(
     notePathInput: string,
   ): VaultNote {
     const notePath =
@@ -1681,6 +2066,11 @@ export async function createKnowledgeRetrievalService(
     {
       protectedPrefixes:
         options.protectedPrefixes,
+      authorityPolicy:
+        options.authorityPolicy,
+      budgets:
+        options.budgets,
     },
   );
 }
+

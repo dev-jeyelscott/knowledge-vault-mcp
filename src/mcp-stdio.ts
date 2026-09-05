@@ -16,6 +16,11 @@ import type {
   KnowledgeRetrievalService,
 } from "./retrieval.js";
 
+import type {
+  AuthorityPathPolicyOptions,
+  RetrievalBudgetOptions,
+} from "./retrieval-policy.js";
+
 /** Reads the one required vault root from process configuration. */
 function readVaultRoot(): string {
   const value =
@@ -32,13 +37,12 @@ function readVaultRoot(): string {
   return value;
 }
 
-/** Parses optional comma-separated protected vault-relative prefixes from process configuration. */
-function readProtectedPrefixes():
-  | string[]
-  | undefined {
+/** Parses one optional comma-separated environment list and preserves an explicit empty list as an override. */
+function readCommaSeparatedList(
+  name: string,
+): string[] | undefined {
   const configured =
-    process.env
-      .KNOWLEDGE_VAULT_PROTECTED_PREFIXES;
+    process.env[name];
 
   if (configured === undefined) {
     return undefined;
@@ -51,6 +55,100 @@ function readProtectedPrefixes():
         value.trim(),
     )
     .filter(Boolean);
+}
+
+/** Parses one optional positive integer environment value and fails clearly on malformed configuration. */
+function readPositiveInteger(
+  name: string,
+): number | undefined {
+  const configured =
+    process.env[name];
+
+  if (configured === undefined) {
+    return undefined;
+  }
+
+  const value =
+    configured.trim();
+
+  if (!/^\d+$/.test(value)) {
+    throw new Error(
+      `${name} must be a positive integer.`,
+    );
+  }
+
+  return Number(value);
+}
+
+/** Reads permanent protected prefixes separately from authority-tier search rules. */
+function readProtectedPrefixes():
+  | string[]
+  | undefined {
+  return readCommaSeparatedList(
+    "KNOWLEDGE_VAULT_PROTECTED_PREFIXES",
+  );
+}
+
+/** Reads optional authority pattern overrides without checking whether their directories currently exist. */
+function readAuthorityPolicy():
+  AuthorityPathPolicyOptions {
+  return {
+    tier1Patterns:
+      readCommaSeparatedList(
+        "KNOWLEDGE_VAULT_AUTHORITY_TIER1_PATTERNS",
+      ),
+
+    tier2Patterns:
+      readCommaSeparatedList(
+        "KNOWLEDGE_VAULT_AUTHORITY_TIER2_PATTERNS",
+      ),
+
+    sourcePatterns:
+      readCommaSeparatedList(
+        "KNOWLEDGE_VAULT_AUTHORITY_SOURCE_PATTERNS",
+      ),
+
+    excludedPatterns:
+      readCommaSeparatedList(
+        "KNOWLEDGE_VAULT_AUTHORITY_EXCLUDED_PATTERNS",
+      ),
+  };
+}
+
+/** Reads optional bounded retrieval limits that are validated again against hard ceilings during service construction. */
+function readRetrievalBudgets():
+  RetrievalBudgetOptions {
+  return {
+    defaultSearchLimit:
+      readPositiveInteger(
+        "KNOWLEDGE_VAULT_DEFAULT_SEARCH_LIMIT",
+      ),
+
+    maxSearchResults:
+      readPositiveInteger(
+        "KNOWLEDGE_VAULT_MAX_SEARCH_RESULTS",
+      ),
+
+    searchExcerptChars:
+      readPositiveInteger(
+        "KNOWLEDGE_VAULT_SEARCH_EXCERPT_CHARS",
+      ),
+
+    maxSectionChars:
+      readPositiveInteger(
+        "KNOWLEDGE_VAULT_MAX_SECTION_CHARS",
+      ),
+
+    maxFullNoteChars:
+      readPositiveInteger(
+        "KNOWLEDGE_VAULT_MAX_FULL_NOTE_CHARS",
+      ),
+
+    maxAggregateBytes:
+      readPositiveInteger(
+        "KNOWLEDGE_VAULT_MAX_PAYLOAD_BYTES",
+      ),
+  };
 }
 
 /** Builds a connection-pinned MCP server factory around one immutable retrieval snapshot. */
@@ -90,7 +188,7 @@ function reportFatalError(
   process.exitCode = 1;
 }
 
-/** Loads one configured vault snapshot and exposes its read-only retrieval service over MCP stdio. */
+/** Loads one configured vault snapshot and exposes its authority-aware bounded read-only retrieval service over MCP stdio. */
 async function main(): Promise<void> {
   const retrieval =
     await createKnowledgeRetrievalService({
@@ -99,6 +197,12 @@ async function main(): Promise<void> {
 
       protectedPrefixes:
         readProtectedPrefixes(),
+
+      authorityPolicy:
+        readAuthorityPolicy(),
+
+      budgets:
+        readRetrievalBudgets(),
     });
 
   serveStdio(
@@ -119,3 +223,4 @@ async function main(): Promise<void> {
 void main().catch(
   reportFatalError,
 );
+

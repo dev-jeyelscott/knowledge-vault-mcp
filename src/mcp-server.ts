@@ -4,6 +4,11 @@ import {
 
 import * as z from "zod/v4";
 
+import {
+  HARD_MAX_FULL_NOTE_CHARS,
+  HARD_MAX_SEARCH_RESULTS,
+} from "./retrieval-policy.js";
+
 import type {
   KnowledgeRetrievalService,
 } from "./retrieval.js";
@@ -76,7 +81,7 @@ export function createKnowledgeMcpServer(
         "Search Knowledge",
 
       description:
-        "Search visible vault notes using deterministic lexical ranking. Returns bounded path, title, score, and concise relevance evidence. Use filters to narrow project, folder scope, tags, type, or status.",
+        "Search the bounded authority-aware vault index using deterministic lexical ranking. Default scope searches Tier 1 curated knowledge only. Use scope=tier2 for Tier 1 plus Tier 2 historical material, or scope=source for approved Tier 3 raw/source evidence. Folder and metadata filters never bypass authority eligibility.",
 
       annotations:
         READ_ONLY_ANNOTATIONS,
@@ -103,7 +108,7 @@ export function createKnowledgeMcpServer(
               .max(1_024)
               .optional()
               .describe(
-                "Vault-relative folder or scope prefix.",
+                "Vault-relative folder prefix composed with the requested authority scope.",
               ),
 
           tags:
@@ -130,11 +135,24 @@ export function createKnowledgeMcpServer(
               .max(240)
               .optional(),
 
+          scope:
+            z.enum([
+              "default",
+              "tier2",
+              "source",
+            ])
+              .optional()
+              .describe(
+                "Authority scope. default is Tier 1 only, tier2 is Tier 1 plus Tier 2, source is approved Tier 3 raw/source material only.",
+              ),
+
           limit:
             z.number()
               .int()
               .min(1)
-              .max(25)
+              .max(
+                HARD_MAX_SEARCH_RESULTS,
+              )
               .optional(),
         }),
     },
@@ -163,7 +181,7 @@ export function createKnowledgeMcpServer(
         "Get Note Metadata",
 
       description:
-        "Get bounded metadata for one visible note using an exact vault-relative path. Does not return the note body.",
+        "Get bounded body-free metadata for one exact unprotected vault-relative note path. Exact paths are deliberate reads, including Tier 2 or Tier 3 notes. Permanently protected prefixes remain inaccessible, and returned links are filtered so a lower-tier note cannot expose higher-tier related material.",
 
       annotations:
         READ_ONLY_ANNOTATIONS,
@@ -201,7 +219,7 @@ export function createKnowledgeMcpServer(
         "Get Note Section",
 
       description:
-        "Read a bounded Markdown section from one visible note. Prefer a heading. Full-note body retrieval requires an explicit maxChars value.",
+        "Read one bounded Markdown section from an exact unprotected note path. Prefer heading-addressable reads. Full-note body retrieval remains explicit and requires maxChars. Responses report actual returned characters and UTF-8 bytes, not estimated model tokens.",
 
       annotations:
         READ_ONLY_ANNOTATIONS,
@@ -225,7 +243,9 @@ export function createKnowledgeMcpServer(
             z.number()
               .int()
               .min(1)
-              .max(16_000)
+              .max(
+                HARD_MAX_FULL_NOTE_CHARS,
+              )
               .optional(),
         }).refine(
           (input) =>
@@ -264,7 +284,7 @@ export function createKnowledgeMcpServer(
         "Get Related Notes",
 
       description:
-        "Find visible notes connected through resolved vault links. Mutual links rank before outgoing links and backlinks.",
+        "Find authority-filtered notes connected through resolved vault links. Mutual links rank before outgoing links and backlinks. A Tier 1 note cannot surface Tier 2 or Tier 3 relations through this tool.",
 
       annotations:
         READ_ONLY_ANNOTATIONS,
@@ -281,7 +301,9 @@ export function createKnowledgeMcpServer(
             z.number()
               .int()
               .min(1)
-              .max(25)
+              .max(
+                HARD_MAX_SEARCH_RESULTS,
+              )
               .optional(),
         }),
     },
@@ -305,3 +327,4 @@ export function createKnowledgeMcpServer(
 
   return server;
 }
+
